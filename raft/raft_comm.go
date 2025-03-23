@@ -24,6 +24,23 @@ func (rn *RaftNode) RPCSetup() error {
 	}
 	rn.listener = listener
 
+	err = rpc.Register(rn)
+	if err != nil {
+		log.Printf("error: failed to register RaftNode for RPC: %v", err)
+		return err
+	}
+
+	go func() {
+		for {
+			conn, err := rn.listener.Accept()
+			if err != nil {
+				log.Printf("error: failed to accept connection: %v", err)
+				return
+			}
+			go rpc.ServeConn(conn)
+		}
+	}()
+
 	err = rn.EstablishPeerConnections()
 	if err != nil {
 		log.Printf("error: failed to populate peer clients: %v", err)
