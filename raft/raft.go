@@ -1,24 +1,19 @@
 package raft
 
 import (
-	"errors"
 	"log"
 	"net"
 	"net/rpc"
-	"os"
 	"sync"
 	"time"
 
 	"math/rand/v2"
-
-	"github.com/arbha1erao/raft/utils"
 )
 
 type RaftNode struct {
 	id          int
 	addr        string
 	peers       []NodeConfig
-	activePeers []int
 	peerClients map[int]*rpc.Client
 
 	currentTerm int
@@ -45,7 +40,6 @@ func NewRaftNode(ncfg NodeConfig, nodes []NodeConfig) *RaftNode {
 		id:          ncfg.ID,
 		addr:        ncfg.Address,
 		peers:       peers,
-		activePeers: []int{},
 		peerClients: make(map[int]*rpc.Client),
 
 		currentTerm: 0,
@@ -123,16 +117,13 @@ func (rn *RaftNode) startElection() {
 	rn.mu.Lock()
 	rn.currentTerm++
 	rn.votedFor = rn.id
-	activePeers := make([]int, len(rn.activePeers))
-	copy(activePeers, rn.activePeers)
 	rn.mu.Unlock()
 
 	votes := 1
-	for _, peerID := range activePeers {
-		peer := rn.peers[peerID]
-
+	for _, peer := range rn.peers {
 		args := RequestVoteArgs{Term: rn.currentTerm, CandidateID: rn.id}
 		reply := RequestVoteReply{}
+		// TODO: handle error
 		err := rn.peerClients[peer.ID].Call("RaftNode.RequestVoteRPC", args, &reply)
 		if err != nil {
 			log.Printf("error: failed to contact peer %d for vote: %v", peer.ID, err)
@@ -143,7 +134,7 @@ func (rn *RaftNode) startElection() {
 		}
 	}
 
-	if votes > len(activePeers)/2 {
+	if votes > len(rn.peers)/2 {
 		log.Printf("info: node %d is now the leader", rn.id)
 		rn.mu.Lock()
 		rn.state = LEADER
@@ -163,19 +154,10 @@ func (rn *RaftNode) sendHeartbeats() {
 		}
 		reply := AppendEntriesReply{}
 
+		// TODO: handle error
 		err := rn.peerClients[peer.ID].Call("RaftNode.AppendEntriesRPC", &args, &reply)
 		if err != nil {
-			if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, net.ErrClosed) {
-				log.Printf("error: connection to peer %d was refused or timed out", peer.ID)
-			} else if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "connection refused" {
-				log.Printf("error: connection refused when contacting peer %d", peer.ID)
-			} else {
-				log.Printf("error: failed to send heartbeat to %d: %v", peer.ID, err)
-			}
-
-			rn.mu.Lock()
-			utils.RemoveSliceElementInPlace(&rn.activePeers, peer.ID)
-			rn.mu.Unlock()
+			log.Printf("error: failed to send heartbeat to %d: %v", peer.ID, err)
 			continue
 		}
 

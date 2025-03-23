@@ -60,7 +60,6 @@ func (rn *RaftNode) EstablishPeerConnections() error {
 		for attempt := 0; attempt < maxRetries; attempt++ {
 			client, err = rpc.Dial("tcp", peer.Address)
 			if err == nil {
-				rn.activePeers = append(rn.activePeers, peer.ID)
 				break
 			}
 
@@ -71,6 +70,7 @@ func (rn *RaftNode) EstablishPeerConnections() error {
 				backoff *= 2
 				continue
 			}
+
 			log.Printf("error: failed to connect to peer %v address %v: %v", peer.ID, peer.Address, err)
 			return err
 		}
