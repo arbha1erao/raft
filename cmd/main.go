@@ -36,7 +36,12 @@ func main() {
 
 	node := raft.NewRaftNode(*nodeCfg, clusterCfg.Nodes)
 
-	go node.Run()
+	err = node.RPCSetup()
+	if err != nil {
+		log.Fatalf("error: failed to setup rpc: %v", err)
+	}
+
+	node.Run()
 
 	for {
 		time.Sleep(time.Second)

@@ -1,4 +1,4 @@
-cluster_size = 5
+cluster_size = 3
 
 [[nodes]]
 id = 1
@@ -12,10 +12,10 @@ address = "localhost:5002"
 id = 3
 address = "localhost:5003"
 
-[[nodes]]
-id = 4
-address = "localhost:5004"
+# [[nodes]]
+# id = 4
+# address = "localhost:5004"
 
-[[nodes]]
-id = 5
-address = "localhost:5005"
+# [[nodes]]
+# id = 5
+# address = "localhost:5005"
