@@ -1,11 +1,8 @@
 package raft
 
 import (
-	"fmt"
 	"log"
-	"net/rpc"
 	"sync"
-	"time"
 )
 
 type JoinRequest struct {
@@ -19,77 +16,6 @@ type JoinResponse struct {
 	CurrentLeader int
 	Nodes         []NodeConfig
 	ErrorMsg      string
-}
-
-// JoinClusterRPC allows a new node to request joining the cluster
-func (rn *RaftNode) JoinClusterRPC(req JoinRequest, resp *JoinResponse) error {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
-
-	// Only the leader can add new nodes
-	if rn.state != LEADER {
-		resp.Success = false
-		resp.CurrentTerm = rn.currentTerm
-		resp.CurrentLeader = rn.leaderID
-		resp.Nodes = rn.cluster.Nodes
-		resp.ErrorMsg = "Not the leader, try contacting the leader directly"
-		return nil
-	}
-
-	for _, node := range rn.cluster.Nodes {
-		if node.ID == req.NodeID {
-			if node.Address != req.NodeAddr {
-				log.Printf("info: updating node %d address from %s to %s",
-					req.NodeID, node.Address, req.NodeAddr)
-
-				rn.updateNodeAddress(req.NodeID, req.NodeAddr)
-
-				resp.Success = true
-				resp.CurrentTerm = rn.currentTerm
-				resp.CurrentLeader = rn.id
-				resp.Nodes = rn.cluster.Nodes
-				return nil
-			}
-
-			resp.Success = true
-			resp.CurrentTerm = rn.currentTerm
-			resp.CurrentLeader = rn.id
-			resp.Nodes = rn.cluster.Nodes
-			resp.ErrorMsg = "Node already in cluster"
-			return nil
-		}
-	}
-
-	newNode := NodeConfig{
-		ID:      req.NodeID,
-		Address: req.NodeAddr,
-	}
-
-	log.Printf("info: adding new node %d with address %s to cluster", req.NodeID, req.NodeAddr)
-
-	rn.addNode(newNode)
-
-	client, err := rn.connectToPeer(newNode)
-	if err != nil {
-		log.Printf("warn: added node %d but failed to establish connection: %v",
-			newNode.ID, err)
-	} else {
-		rn.peerClients[newNode.ID] = client
-	}
-
-	success := rn.propagateConfigChange()
-
-	if !success {
-		log.Printf("error: failed to propagate configuration change to all followers")
-	} else {
-		log.Printf("info: successfully propagated configuration change to all followers")
-	}
-
-	resp.Success = true
-	resp.CurrentTerm = rn.currentTerm
-	resp.CurrentLeader = rn.id
-	resp.Nodes = rn.cluster.Nodes
-	return nil
 }
 
 type ConfigUpdateRequest struct {
@@ -177,80 +103,8 @@ func (rn *RaftNode) updateNodeAddress(nodeID int, newAddr string) {
 	}
 }
 
-// rebuildPeersList rebuilds the peers list from cluster nodes
-func (rn *RaftNode) rebuildPeersList() {
-	var newPeers []NodeConfig
-	for _, node := range rn.cluster.Nodes {
-		if node.ID != rn.id {
-			newPeers = append(newPeers, node)
-		}
-	}
-	rn.peers = newPeers
-	log.Printf("info: rebuilt peers list, now have %d peers", len(rn.peers))
-}
-
-// connectToNewPeers attempts to connect to any peers not already connected
-func (rn *RaftNode) connectToNewPeers() {
-	for _, peer := range rn.peers {
-		if _, exists := rn.peerClients[peer.ID]; !exists {
-			log.Printf("info: connecting to new peer %d at %s", peer.ID, peer.Address)
-			client, err := rn.connectToPeer(peer)
-			if err == nil {
-				rn.peerClients[peer.ID] = client
-				log.Printf("info: successfully connected to peer %d", peer.ID)
-			} else {
-				log.Printf("warn: failed to connect to peer %d: %v", peer.ID, err)
-			}
-		}
-	}
-}
-
-// connectToAllPeers attempts to connect to all peers, closing and reopening existing connections
-func (rn *RaftNode) connectToAllPeers() {
-	for id, client := range rn.peerClients {
-		client.Close()
-		delete(rn.peerClients, id)
-	}
-
-	for _, peer := range rn.peers {
-		log.Printf("info: connecting to peer %d at %s", peer.ID, peer.Address)
-
-		var client *rpc.Client
-		var err error
-
-		// Try up to 3 times with a short backoff
-		for attempt := 0; attempt < 3; attempt++ {
-			client, err = rn.connectToPeer(peer)
-			if err == nil {
-				break
-			}
-			log.Printf("warn: attempt %d failed to connect to peer %d: %v", attempt+1, peer.ID, err)
-			time.Sleep(100 * time.Millisecond)
-		}
-
-		if err == nil {
-			rn.peerClients[peer.ID] = client
-			log.Printf("info: successfully connected to peer %d", peer.ID)
-		} else {
-			log.Printf("error: all attempts to connect to peer %d failed", peer.ID)
-		}
-	}
-}
-
-// connectToPeer establishes an RPC connection to a peer
-func (rn *RaftNode) connectToPeer(peer NodeConfig) (*rpc.Client, error) {
-	if !verifyNodeConnectivity(peer.Address) {
-		return nil, fmt.Errorf("node at %s is not reachable", peer.Address)
-	}
-
-	client, err := rpc.Dial("tcp", peer.Address)
-	if err != nil {
-		return nil, err
-	}
-	return client, nil
-}
-
-// propagateConfigChange sends the updated configuration to all peers, Returns true if all updates were successful
+// propagateConfigChange sends the updated configuration to all peers
+// Returns true if all updates were successful
 func (rn *RaftNode) propagateConfigChange() bool {
 	if rn.state != LEADER {
 		return false

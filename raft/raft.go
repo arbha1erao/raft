@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"net/rpc"
@@ -8,6 +9,8 @@ import (
 	"time"
 
 	"math/rand/v2"
+
+	"github.com/arbha1erao/raft/clustercfg"
 )
 
 type RaftNode struct {
@@ -26,12 +29,18 @@ type RaftNode struct {
 	heartbeatChan chan int
 	stepDownChan  chan int
 	listener      net.Listener
-	joinMode      bool
+
+	configClient     *clustercfg.Client
+	configUpdateChan chan []NodeConfig
 
 	mu sync.Mutex
 }
 
-func NewRaftNode(ncfg NodeConfig, nodes []NodeConfig) *RaftNode {
+func NewRaftNode(ncfg NodeConfig, nodes []NodeConfig, configClient *clustercfg.Client) *RaftNode {
+	if configClient == nil {
+		log.Fatalf("error: ClusterConfigManager is required, cannot create RaftNode without it")
+	}
+
 	var peers []NodeConfig
 	for _, node := range nodes {
 		if node.ID != ncfg.ID {
@@ -44,7 +53,7 @@ func NewRaftNode(ncfg NodeConfig, nodes []NodeConfig) *RaftNode {
 		Nodes:       nodes,
 	}
 
-	return &RaftNode{
+	rn := &RaftNode{
 		id:          ncfg.ID,
 		addr:        ncfg.Address,
 		peers:       peers,
@@ -56,11 +65,33 @@ func NewRaftNode(ncfg NodeConfig, nodes []NodeConfig) *RaftNode {
 		state:       FOLLOWER,
 		log:         []LogEntry{},
 		leaderID:    -1,
-		joinMode:    false,
 
-		heartbeatChan: make(chan int),
-		stepDownChan:  make(chan int),
+		heartbeatChan: make(chan int, 100),
+		stepDownChan:  make(chan int, 10),
+
+		configClient:     configClient,
+		configUpdateChan: make(chan []NodeConfig, 10),
 	}
+
+	configClient.StartConfigUpdateLoop(10*time.Second, func(config clustercfg.ClusterConfig) {
+		var updatedConfigs []NodeConfig
+		for id, addr := range config.Nodes {
+			updatedConfigs = append(updatedConfigs, NodeConfig{
+				ID:      id,
+				Address: addr,
+			})
+		}
+
+		log.Printf("info: received configuration update from ClusterConfigManager with %d nodes", len(updatedConfigs))
+
+		select {
+		case rn.configUpdateChan <- updatedConfigs:
+		default:
+			log.Printf("warn: config update channel full, skipping update")
+		}
+	})
+
+	return rn
 }
 
 func (rn *RaftNode) Run() {
@@ -69,35 +100,39 @@ func (rn *RaftNode) Run() {
 
 	log.Printf("info: node %v started as a %v", rn.id, rn.state)
 
-	// If this is a new node starting (not in the initial config), attempt to join the cluster
-	if rn.isNewNode() {
-		rn.joinMode = true
-		joinSucceeded := make(chan bool, 1)
-		go func() {
-			success := rn.joinCluster()
-			joinSucceeded <- success
-		}()
+	log.Printf("info: node %v waiting for cluster quorum via ClusterConfigManager", rn.id)
+	quorumReached := rn.configClient.WaitForQuorum(5 * time.Minute)
+	if !quorumReached {
+		log.Printf("warn: timed out waiting for quorum, continuing as standalone node")
+	} else {
+		log.Printf("info: quorum reached, proceeding with Raft protocol")
 
-		select {
-		case success := <-joinSucceeded:
-			if !success {
-				log.Printf("error: failed to join cluster after all attempts, continuing as standalone node")
-			} else {
-				log.Printf("info: successfully joined cluster, proceeding with normal operation")
+		_, err := rn.configClient.GetConfig()
+		if err != nil {
+			log.Printf("error: failed to get config: %v", err)
+		} else {
+			cmNodes := rn.configClient.GetNodeConfig()
+			var nodes []NodeConfig
+			for _, n := range cmNodes {
+				nodes = append(nodes, NodeConfig{
+					ID:      n.ID,
+					Address: n.Address,
+				})
 			}
-			rn.joinMode = false
-		case <-time.After(10 * time.Second):
-			log.Printf("error: timed out trying to join cluster, continuing as standalone node")
-			rn.joinMode = false
+			rn.UpdateClusterConfiguration(nodes)
 		}
 	}
 
-	for {
-		if rn.joinMode {
-			time.Sleep(100 * time.Millisecond)
-			continue
+	go func() {
+		for updatedNodes := range rn.configUpdateChan {
+			rn.UpdateClusterConfiguration(updatedNodes)
 		}
+	}()
 
+	// Add a small random delay before starting election loop to reduce simultaneous elections
+	time.Sleep(time.Duration(rand.Int64N(500)) * time.Millisecond)
+
+	for {
 		rn.mu.Lock()
 		switch rn.state {
 		case FOLLOWER:
@@ -150,6 +185,67 @@ func (rn *RaftNode) Run() {
 			}
 		}
 	}
+}
+
+// UpdateClusterConfiguration updates the cluster configuration with the provided nodes
+func (rn *RaftNode) UpdateClusterConfiguration(nodes []NodeConfig) {
+	rn.mu.Lock()
+	defer rn.mu.Unlock()
+
+	log.Printf("info: updating cluster configuration with %d nodes", len(nodes))
+
+	rn.cluster.Nodes = nodes
+	rn.cluster.ClusterSize = len(nodes)
+
+	rn.rebuildPeersList()
+
+	rn.connectToAllPeers()
+
+	log.Printf("info: cluster configuration updated successfully")
+}
+
+// connectToAllPeers attempts to connect to all peers, closing and reopening existing connections
+func (rn *RaftNode) connectToAllPeers() {
+	for id, client := range rn.peerClients {
+		client.Close()
+		delete(rn.peerClients, id)
+	}
+
+	for _, peer := range rn.peers {
+		log.Printf("info: connecting to peer %d at %s", peer.ID, peer.Address)
+
+		var client *rpc.Client
+		var err error
+
+		for attempt := 0; attempt < 3; attempt++ {
+			client, err = rn.connectToPeer(peer)
+			if err == nil {
+				break
+			}
+			log.Printf("warn: attempt %d failed to connect to peer %d: %v", attempt+1, peer.ID, err)
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		if err == nil {
+			rn.peerClients[peer.ID] = client
+			log.Printf("info: successfully connected to peer %d", peer.ID)
+		} else {
+			log.Printf("error: all attempts to connect to peer %d failed", peer.ID)
+		}
+	}
+}
+
+// connectToPeer establishes an RPC connection to a peer
+func (rn *RaftNode) connectToPeer(peer NodeConfig) (*rpc.Client, error) {
+	if !verifyNodeConnectivity(peer.Address) {
+		return nil, fmt.Errorf("node at %s is not reachable", peer.Address)
+	}
+
+	client, err := rpc.Dial("tcp", peer.Address)
+	if err != nil {
+		return nil, err
+	}
+	return client, nil
 }
 
 func (rn *RaftNode) startElection() {
@@ -269,138 +365,32 @@ func randomElectionTimeout() time.Duration {
 	return time.Duration(300+rand.Int64N(200)) * time.Millisecond
 }
 
-// isNewNode determines if this is a new node joining an existing cluster
-func (rn *RaftNode) isNewNode() bool {
-	// Check if this node is set up with a single-node configuration
-	// This is an indicator that it's a new node that needs to join
-	return len(rn.peers) == 0 && rn.cluster.ClusterSize == 1
+// rebuildPeersList rebuilds the peers list from cluster nodes
+func (rn *RaftNode) rebuildPeersList() {
+	var newPeers []NodeConfig
+	for _, node := range rn.cluster.Nodes {
+		if node.ID != rn.id {
+			newPeers = append(newPeers, node)
+		}
+	}
+	rn.peers = newPeers
+	log.Printf("info: rebuilt peers list, now have %d peers", len(rn.peers))
 }
 
-// joinCluster attempts to join an existing cluster by contacting known seed nodes
-// Returns true if join was successful, false otherwise
-func (rn *RaftNode) joinCluster() bool {
-	// FIX ME
-	// In a real implementation, have a list of seed nodes to try
-	// For now, we'll simulate by trying to connect to nodes listed in config.toml
-
-	// Read seed nodes from environment or use default ports
-	seedAddresses := []string{
-		"localhost:5001",
-		"localhost:5002",
-		"localhost:5003",
-		"localhost:5004",
-		"localhost:5005",
-	}
-
-	var filteredAddresses []string
-	for _, addr := range seedAddresses {
-		if addr != rn.addr {
-			filteredAddresses = append(filteredAddresses, addr)
-		}
-	}
-
-	joinRequest := JoinRequest{
-		NodeID:   rn.id,
-		NodeAddr: rn.addr,
-	}
-
-	for _, addr := range filteredAddresses {
-		log.Printf("info: attempting to join cluster via %s", addr)
-
-		if !verifyNodeConnectivity(addr) {
-			log.Printf("warn: node at %s is not reachable, trying next node", addr)
-			continue
-		}
-
-		client, err := rpc.Dial("tcp", addr)
-		if err != nil {
-			log.Printf("warn: failed to connect to %s: %v", addr, err)
-			continue
-		}
-
-		var resp JoinResponse
-		err = client.Call("RaftNode.JoinClusterRPC", joinRequest, &resp)
-		if err != nil {
-			log.Printf("warn: join request to %s failed: %v", addr, err)
-			client.Close()
-			continue
-		}
-
-		if resp.Success {
-			log.Printf("info: successfully joined cluster via %s", addr)
-
-			rn.mu.Lock()
-			rn.cluster.Nodes = resp.Nodes
-			rn.cluster.ClusterSize = len(resp.Nodes)
-			rn.currentTerm = resp.CurrentTerm
-			rn.leaderID = resp.CurrentLeader
-
-			rn.rebuildPeersList()
-			rn.mu.Unlock()
-
-			rn.connectToNewPeers()
-
-			client.Close()
-			return true
-		}
-
-		if resp.CurrentLeader > 0 && resp.CurrentLeader != rn.id {
-			log.Printf("info: redirected to leader %d", resp.CurrentLeader)
-
-			var leaderAddr string
-			for _, node := range resp.Nodes {
-				if node.ID == resp.CurrentLeader {
-					leaderAddr = node.Address
-					break
-				}
-			}
-
-			if leaderAddr != "" {
-				client.Close()
-
-				if !verifyNodeConnectivity(leaderAddr) {
-					log.Printf("warn: leader at %s is not reachable, trying next node", leaderAddr)
-					continue
-				}
-
-				client, err = rpc.Dial("tcp", leaderAddr)
-				if err != nil {
-					log.Printf("warn: failed to connect to leader at %s: %v", leaderAddr, err)
-					continue
-				}
-
-				err = client.Call("RaftNode.JoinClusterRPC", joinRequest, &resp)
-				if err != nil {
-					log.Printf("warn: join request to leader failed: %v", err)
-					client.Close()
-					continue
-				}
-
-				if resp.Success {
-					log.Printf("info: successfully joined cluster via leader %d", resp.CurrentLeader)
-
-					rn.mu.Lock()
-					rn.cluster.Nodes = resp.Nodes
-					rn.cluster.ClusterSize = len(resp.Nodes)
-					rn.currentTerm = resp.CurrentTerm
-					rn.leaderID = resp.CurrentLeader
-
-					rn.rebuildPeersList()
-					rn.mu.Unlock()
-
-					rn.connectToNewPeers()
-
-					client.Close()
-					return true
-				}
+// connectToNewPeers attempts to connect to any peers not already connected
+func (rn *RaftNode) connectToNewPeers() {
+	for _, peer := range rn.peers {
+		if _, exists := rn.peerClients[peer.ID]; !exists {
+			log.Printf("info: connecting to new peer %d at %s", peer.ID, peer.Address)
+			client, err := rn.connectToPeer(peer)
+			if err == nil {
+				rn.peerClients[peer.ID] = client
+				log.Printf("info: successfully connected to peer %d", peer.ID)
+			} else {
+				log.Printf("warn: failed to connect to peer %d: %v", peer.ID, err)
 			}
 		}
-
-		client.Close()
 	}
-
-	log.Printf("warn: failed to join cluster, will continue as standalone node")
-	return false
 }
 
 // verifyNodeConnectivity attempts to establish a connection to the specified address and returns whether the connection was successful
@@ -419,10 +409,20 @@ func verifyNodeConnectivity(addr string) bool {
 func (rn *RaftNode) handleHigherTerm(term int) {
 	rn.mu.Lock()
 	if term > rn.currentTerm {
+		wasLeader := (rn.state == LEADER)
+		oldTerm := rn.currentTerm
+
 		rn.currentTerm = term
 		rn.state = FOLLOWER
 		rn.votedFor = -1
 		rn.leaderID = -1
+
+		if wasLeader {
+			log.Printf("info: node %d was leader for term %d, stepping down to follower for term %d",
+				rn.id, oldTerm, term)
+		} else {
+			log.Printf("info: node %d becoming follower for term %d", rn.id, term)
+		}
 
 		if rn.state == LEADER || rn.state == CANDIDATE {
 			go func() {
