@@ -28,11 +28,19 @@ func (rn *RaftNode) RequestVoteRPC(args RequestVoteArgs, reply *RequestVoteReply
 		rn.currentTerm = args.Term
 		rn.votedFor = -1
 		rn.state = FOLLOWER
+		rn.leaderID = -1
 	}
 
 	if rn.votedFor == -1 || rn.votedFor == args.CandidateID {
+		// FIX ME
+		// In a full implementation, also check log up-to-date status here
 		rn.votedFor = args.CandidateID
 		reply.VoteGranted = true
+
+		select {
+		case rn.heartbeatChan <- 1:
+		default:
+		}
 	} else {
 		reply.VoteGranted = false
 	}

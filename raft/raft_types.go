@@ -8,9 +8,27 @@ const (
 	LEADER    State = "LEADER"
 )
 
+type ConfigChangeType int
+
+const (
+	AddNode ConfigChangeType = iota
+	RemoveNode
+)
+
+type ConfigChange struct {
+	Type       ConfigChangeType
+	NodeID     int
+	NodeConfig NodeConfig
+}
+
+type Configuration struct {
+	Nodes map[int]NodeConfig
+}
+
 type LogEntry struct {
-	Term    int
-	Command any
+	Term         int
+	Command      any
+	ConfigChange *ConfigChange
 }
 
 type ClusterConfig struct {
